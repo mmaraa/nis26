@@ -1,0 +1,99 @@
+// Joiner timeline: everything that happened to ONE employee, across every system,
+// keyed by employeeId (not by run id). Run it in the Log Analytics workspace that
+// receives App Insights (workspace-based), the Entra diagnostic settings
+// (ProvisioningLogs, AuditLogs) and the Logic App / Automation diagnostics.
+//
+//   HR app             AppTraces   Properties.employeeId        (step HrScimSent)
+//   UPN resolver       AppTraces   Properties.employeeId        (step ResolveUpn)
+//   Both Logic Apps    AzureDiagnostics MICROSOFT.LOGIC trackedProperties_*
+//                      (ingest: ResolveUpn, EnrichScim, BulkUpload; access package:
+//                       AccessPackageGranted, OnPremRunbookStarted)
+//   Entra provisioning AADProvisioningLogs  inbound API app + Cloud Sync Entra -> AD job
+//   Entra audit        AuditLogs   by objectId (user created, LCW, access package, groups)
+//   Hybrid Worker      AzureDiagnostics JobStreams (runbook JSON output lines)
+//
+// Note: ProvisioningLogs / AuditLogs typically arrive 5-15 minutes after the fact.
+let employeeId = "E00021";
+let lookback = 1d;
+// --- HR app + UPN resolver (App Insights traces) ---------------------------------
+let appTraces = AppTraces
+    | where TimeGenerated > ago(lookback)
+    | where tostring(Properties.employeeId) == employeeId
+    | project TimeGenerated,
+        System = case(AppRoleName has "func" or tostring(Properties.step) == "ResolveUpn", "UPN resolver", "HR app"),
+        Step = tostring(Properties.step),
+        Result = coalesce(tostring(Properties.result), tostring(Properties.statusCode)),
+        Detail = Message,
+        CorrelationId = tostring(Properties.correlationId);
+let correlationIds = appTraces | where isnotempty(CorrelationId) | distinct CorrelationId;
+// --- Both Logic Apps (tracked properties via diagnostic settings) ---------------------
+let logicApps = AzureDiagnostics
+    | where TimeGenerated > ago(lookback)
+    | where ResourceProvider == "MICROSOFT.LOGIC" and Category == "WorkflowRuntime"
+    | extend tpEmployee = column_ifexists("trackedProperties_employeeId_s", ""),
+        tpCorrelation = column_ifexists("trackedProperties_correlationId_s", ""),
+        tpStep = column_ifexists("trackedProperties_step_s", "")
+    | where isnotempty(tpStep)
+    | where tpEmployee == employeeId
+        or (isempty(tpEmployee) and tpCorrelation in (correlationIds))
+    | project TimeGenerated,
+        System = strcat("Logic App: ", column_ifexists("resource_workflowName_s", Resource)),
+        Step = tpStep,
+        Result = column_ifexists("status_s", ""),
+        Detail = strcat(column_ifexists("resource_actionName_s", ""),
+            iff(isnotempty(column_ifexists("trackedProperties_upn_s", "")), strcat(" -> ", column_ifexists("trackedProperties_upn_s", "")), ""),
+            iff(isnotempty(column_ifexists("trackedProperties_statusCode_s", "")), strcat(" HTTP ", column_ifexists("trackedProperties_statusCode_s", "")), ""),
+            iff(isnotempty(column_ifexists("trackedProperties_jobId_s", "")), strcat(" job ", column_ifexists("trackedProperties_jobId_s", "")), "")),
+        CorrelationId = tpCorrelation;
+// --- Entra provisioning logs -------------------------------------------------------
+// SourceIdentity / TargetIdentity / ServicePrincipal / TargetSystem are JSON strings;
+// key casing differs between sources, so read both.
+let prov = AADProvisioningLogs
+    | where TimeGenerated > ago(lookback)
+    | extend src = parse_json(SourceIdentity), tgt = parse_json(TargetIdentity),
+        sp = parse_json(ServicePrincipal), ts = parse_json(TargetSystem)
+    | extend srcId = tostring(coalesce(src.Id, src.id)), tgtId = tostring(coalesce(tgt.Id, tgt.id)),
+        tgtType = tostring(coalesce(tgt.IdentityType, tgt.identityType)),
+        spName = tostring(coalesce(sp.Name, sp.name)), tsName = tostring(coalesce(ts.DisplayName, ts.displayName));
+// Inbound API-driven app: the source is the HR record (externalId = employeeId).
+let inbound = prov | where srcId == employeeId or SourceIdentity has employeeId;
+let objectIds = union
+    (inbound | where tgtType =~ "User" and isnotempty(tgtId) | project oid = tgtId),
+    (AzureDiagnostics
+        | where TimeGenerated > ago(lookback) and ResourceProvider == "MICROSOFT.LOGIC"
+        | where column_ifexists("trackedProperties_employeeId_s", "") == employeeId
+        | project oid = column_ifexists("trackedProperties_objectId_s", ""))
+    | where isnotempty(oid)
+    | distinct oid;
+// Cloud Sync Entra -> AD job: the source is the Entra user object.
+let cloudSync = prov | where srcId in (objectIds);
+let entraProvisioning = union inbound, cloudSync
+    | project TimeGenerated,
+        System = strcat("Entra provisioning: ", spName),
+        Step = strcat(ProvisioningAction, " -> ", tsName),
+        Result = ResultType,
+        Detail = strcat(tostring(coalesce(tgt.DisplayName, tgt.displayName)), " ", ResultDescription),
+        CorrelationId = CycleId;
+// --- Entra audit (user object, LCW, access package, license group) --------------
+let audit = AuditLogs
+    | where TimeGenerated > ago(lookback)
+    | mv-expand target = TargetResources
+    | where tostring(target.id) in (objectIds)
+    | summarize arg_min(TimeGenerated, *) by Id
+    | project TimeGenerated, System = strcat("Entra audit: ", Category), Step = OperationName,
+        Result = Result, Detail = strcat(tostring(InitiatedBy.app.displayName), tostring(InitiatedBy.user.userPrincipalName)),
+        CorrelationId = CorrelationId;
+// --- Hybrid Worker runbook ------------------------------------------------------------
+let runbook = AzureDiagnostics
+    | where TimeGenerated > ago(lookback)
+    | where ResourceProvider == "MICROSOFT.AUTOMATION" and Category == "JobStreams"
+    | where ResultDescription has employeeId
+    | extend line = parse_json(ResultDescription)
+    | where tostring(line.employeeId) == employeeId
+    | project TimeGenerated, System = "Hybrid Worker (on-prem)", Step = tostring(line.step),
+        Result = tostring(line.result),
+        Detail = strcat(RunbookName_s, " ", tostring(line.samAccountName), " ", tostring(line.dn)),
+        CorrelationId = tostring(line.correlationId);
+union appTraces, logicApps, entraProvisioning, audit, runbook
+| order by TimeGenerated asc
+| project TimeGenerated, System, Step, Result, Detail, CorrelationId

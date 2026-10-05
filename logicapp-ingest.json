@@ -1,0 +1,381 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "triggers": {
+    "When_HR_sends_SCIM": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "method": "POST",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "schemas": {
+              "type": "array"
+            },
+            "Operations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "method": {
+                    "type": "string"
+                  },
+                  "bulkId": {
+                    "type": "string"
+                  },
+                  "path": {
+                    "type": "string"
+                  },
+                  "data": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "bulkId",
+                  "data"
+                ]
+              }
+            }
+          },
+          "required": [
+            "Operations"
+          ]
+        }
+      },
+      "operationOptions": "EnableSchemaValidation",
+      "trackedProperties": {
+        "step": "HrScimReceived",
+        "correlationId": "@{trigger()?['outputs']?['headers']?['x-correlation-id']}",
+        "event": "@{trigger()?['outputs']?['headers']?['x-demo-event']}",
+        "operations": "@{length(trigger()?['outputs']?['body']?['Operations'])}"
+      }
+    }
+  },
+  "actions": {
+    "Initialize_context": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "correlationId",
+            "type": "string",
+            "value": "@{coalesce(triggerOutputs()?['headers']?['x-correlation-id'], workflow()?['run']?['name'])}"
+          }
+        ]
+      },
+      "runAfter": {}
+    },
+    "Initialize_event": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "eventTag",
+            "type": "string",
+            "value": "@{coalesce(triggerOutputs()?['headers']?['x-demo-event'], parameters('eventTag'))}"
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_context": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_enriched_operations": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "enrichedOperations",
+            "type": "array",
+            "value": []
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_event": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Initialize_resolved": {
+      "type": "InitializeVariable",
+      "inputs": {
+        "variables": [
+          {
+            "name": "resolved",
+            "type": "array",
+            "value": []
+          }
+        ]
+      },
+      "runAfter": {
+        "Initialize_enriched_operations": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Resolve_and_enrich": {
+      "type": "Scope",
+      "runAfter": {
+        "Initialize_resolved": [
+          "Succeeded"
+        ]
+      },
+      "actions": {
+        "For_each_operation": {
+          "type": "Foreach",
+          "foreach": "@triggerBody()?['Operations']",
+          "runtimeConfiguration": {
+            "concurrency": {
+              "repetitions": 1
+            }
+          },
+          "actions": {
+            "Normalize_input": {
+              "type": "Compose",
+              "inputs": {
+                "employeeId": "@{coalesce(items('For_each_operation')?['data']?['externalId'], items('For_each_operation')?['bulkId'])}",
+                "givenName": "@{items('For_each_operation')?['data']?['name']?['givenName']}",
+                "familyName": "@{items('For_each_operation')?['data']?['name']?['familyName']}",
+                "middleName": "@items('For_each_operation')?['data']?['name']?['middleName']"
+              },
+              "runAfter": {}
+            },
+            "Resolve_UPN": {
+              "type": "Http",
+              "description": "Deterministic UPN resolver (Python Function). The function key is a secure workflow parameter, so inputs are hidden in run history; the outputs (UPN + candidate trail) stay visible.",
+              "inputs": {
+                "method": "POST",
+                "uri": "@{parameters('upnResolverUrl')}",
+                "headers": {
+                  "Content-Type": "application/json",
+                  "x-functions-key": "@{parameters('upnResolverKey')}",
+                  "x-correlation-id": "@{variables('correlationId')}"
+                },
+                "body": {
+                  "givenName": "@{outputs('Normalize_input')?['givenName']}",
+                  "familyName": "@{outputs('Normalize_input')?['familyName']}",
+                  "middleName": "@outputs('Normalize_input')?['middleName']",
+                  "employeeId": "@{outputs('Normalize_input')?['employeeId']}",
+                  "domain": "@{parameters('upnDomain')}",
+                  "correlationId": "@{variables('correlationId')}"
+                },
+                "retryPolicy": {
+                  "type": "exponential",
+                  "count": 3,
+                  "interval": "PT5S"
+                }
+              },
+              "runtimeConfiguration": {
+                "secureData": {
+                  "properties": [
+                    "inputs"
+                  ]
+                }
+              },
+              "runAfter": {
+                "Normalize_input": [
+                  "Succeeded"
+                ]
+              },
+              "trackedProperties": {
+                "step": "ResolveUpn",
+                "employeeId": "@{action()?['outputs']?['body']?['employeeId']}",
+                "correlationId": "@{action()?['outputs']?['body']?['correlationId']}",
+                "upn": "@{action()?['outputs']?['body']?['upn']}",
+                "reused": "@{action()?['outputs']?['body']?['reused']}"
+              }
+            },
+            "Work_email": {
+              "type": "Compose",
+              "inputs": {
+                "value": "@{body('Resolve_UPN')?['mail']}",
+                "type": "work",
+                "primary": false
+              },
+              "runAfter": {
+                "Resolve_UPN": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Identity_extension": {
+              "type": "Compose",
+              "inputs": {
+                "mailNickname": "@{body('Resolve_UPN')?['mailNickname']}"
+              },
+              "runAfter": {
+                "Work_email": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Enrich_operation": {
+              "type": "Compose",
+              "description": "userName = resolved UPN, add a work email (-> mail) and the identity extension (-> mailNickname). HR data is left untouched otherwise.",
+              "inputs": "@setProperty(items('For_each_operation'), 'data', setProperty(setProperty(setProperty(setProperty(items('For_each_operation')?['data'], 'userName', body('Resolve_UPN')?['upn']), 'emails', union(coalesce(items('For_each_operation')?['data']?['emails'], createArray()), createArray(outputs('Work_email')))), 'schemas', union(items('For_each_operation')?['data']?['schemas'], createArray(parameters('identityExtensionSchema')))), parameters('identityExtensionSchema'), outputs('Identity_extension')))",
+              "runAfter": {
+                "Identity_extension": [
+                  "Succeeded"
+                ]
+              },
+              "trackedProperties": {
+                "step": "EnrichScim",
+                "employeeId": "@{action()?['outputs']?['bulkId']}",
+                "upn": "@{action()?['outputs']?['data']?['userName']}"
+              }
+            },
+            "Append_enriched": {
+              "type": "AppendToArrayVariable",
+              "inputs": {
+                "name": "enrichedOperations",
+                "value": "@outputs('Enrich_operation')"
+              },
+              "runAfter": {
+                "Enrich_operation": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Append_resolved": {
+              "type": "AppendToArrayVariable",
+              "inputs": {
+                "name": "resolved",
+                "value": {
+                  "employeeId": "@{outputs('Normalize_input')?['employeeId']}",
+                  "upn": "@{body('Resolve_UPN')?['upn']}",
+                  "samAccountName": "@{body('Resolve_UPN')?['samAccountName']}",
+                  "reused": "@body('Resolve_UPN')?['reused']",
+                  "candidateTrail": "@body('Resolve_UPN')?['candidateTrail']"
+                }
+              },
+              "runAfter": {
+                "Append_enriched": [
+                  "Succeeded"
+                ]
+              }
+            }
+          },
+          "runAfter": {}
+        }
+      }
+    },
+    "Send_to_bulkUpload": {
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "@{parameters('bulkUploadUrl')}",
+        "headers": {
+          "Content-Type": "application/scim+json",
+          "x-correlation-id": "@{variables('correlationId')}"
+        },
+        "body": {
+          "schemas": [
+            "urn:ietf:params:scim:api:messages:2.0:BulkRequest"
+          ],
+          "Operations": "@variables('enrichedOperations')",
+          "failOnErrors": null
+        },
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://graph.microsoft.com"
+        },
+        "retryPolicy": {
+          "type": "exponential",
+          "count": 4,
+          "interval": "PT10S",
+          "minimumInterval": "PT5S",
+          "maximumInterval": "PT1M"
+        }
+      },
+      "runAfter": {
+        "Resolve_and_enrich": [
+          "Succeeded"
+        ]
+      },
+      "trackedProperties": {
+        "step": "BulkUpload",
+        "correlationId": "@{action()?['inputs']?['headers']?['x-correlation-id']}",
+        "statusCode": "@{action()?['outputs']?['statusCode']}",
+        "operations": "@{length(action()?['inputs']?['body']?['Operations'])}"
+      }
+    },
+    "Respond_accepted": {
+      "type": "Response",
+      "kind": "Http",
+      "inputs": {
+        "statusCode": 202,
+        "headers": {
+          "Content-Type": "application/json",
+          "x-correlation-id": "@{variables('correlationId')}"
+        },
+        "body": {
+          "correlationId": "@{variables('correlationId')}",
+          "runId": "@{workflow()?['run']?['name']}",
+          "event": "@{variables('eventTag')}",
+          "bulkUploadStatus": "@outputs('Send_to_bulkUpload')?['statusCode']",
+          "resolved": "@variables('resolved')"
+        }
+      },
+      "runAfter": {
+        "Send_to_bulkUpload": [
+          "Succeeded"
+        ]
+      }
+    },
+    "Respond_failed": {
+      "type": "Response",
+      "kind": "Http",
+      "inputs": {
+        "statusCode": 502,
+        "headers": {
+          "Content-Type": "application/json",
+          "x-correlation-id": "@{variables('correlationId')}"
+        },
+        "body": {
+          "correlationId": "@{variables('correlationId')}",
+          "runId": "@{workflow()?['run']?['name']}",
+          "error": "Resolving or forwarding to /bulkUpload failed; see the run history for the failing employeeId.",
+          "resolved": "@variables('resolved')"
+        }
+      },
+      "runAfter": {
+        "Send_to_bulkUpload": [
+          "Failed",
+          "Skipped",
+          "TimedOut"
+        ]
+      }
+    }
+  },
+  "outputs": {},
+  "parameters": {
+    "upnDomain": {
+      "type": "String",
+      "defaultValue": ""
+    },
+    "bulkUploadUrl": {
+      "type": "String",
+      "defaultValue": ""
+    },
+    "upnResolverUrl": {
+      "type": "String",
+      "defaultValue": ""
+    },
+    "upnResolverKey": {
+      "type": "SecureString",
+      "defaultValue": ""
+    },
+    "eventTag": {
+      "type": "String",
+      "defaultValue": ""
+    },
+    "identityExtensionSchema": {
+      "type": "String",
+      "defaultValue": "urn:ietf:params:scim:schemas:extension:identity:1.0:User"
+    }
+  }
+}

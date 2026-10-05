@@ -1,0 +1,117 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "automationAccountId": { "type": "String", "defaultValue": "" },
+    "runbookName": { "type": "String", "defaultValue": "Add-UserToOnPremApp" },
+    "hybridWorkerGroup": { "type": "String", "defaultValue": "lab-local" },
+    "eventTag": { "type": "String", "defaultValue": "" }
+  },
+  "triggers": {
+    "When_access_package_is_granted": {
+      "type": "Request",
+      "kind": "Http",
+      "description": "Called by the Entitlement Management custom extension (stage: Assignment is granted, launch and continue). The catalog wizard adds the Entra authorization policy to this Logic App.",
+      "inputs": {
+        "method": "POST",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "Stage": { "type": "string" },
+            "AccessPackageAssignmentRequestId": { "type": "string" },
+            "Assignment": {
+              "type": "object",
+              "properties": {
+                "Id": { "type": "string" },
+                "Target": {
+                  "type": "object",
+                  "properties": {
+                    "ObjectId": { "type": "string" },
+                    "PrincipalName": { "type": "string" },
+                    "DisplayName": { "type": "string" }
+                  }
+                },
+                "AccessPackage": {
+                  "type": "object",
+                  "properties": { "Id": { "type": "string" }, "DisplayName": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "actions": {
+    "Acknowledge": {
+      "type": "Response",
+      "kind": "Http",
+      "inputs": { "statusCode": 202 },
+      "runAfter": {}
+    },
+    "Is_test_call": {
+      "type": "If",
+      "description": "Entitlement Management sends a test call when the extension is saved; it has no assignment target.",
+      "expression": {
+        "or": [
+          { "equals": ["@coalesce(triggerBody()?['Assignment']?['Target']?['ObjectId'], '')", ""] }
+        ]
+      },
+      "actions": {
+        "Test_call_done": { "type": "Terminate", "inputs": { "runStatus": "Succeeded" }, "runAfter": {} }
+      },
+      "else": { "actions": {} },
+      "runAfter": { "Acknowledge": ["Succeeded"] }
+    },
+    "Get_user": {
+      "type": "Http",
+      "description": "The callout carries the object id; read employeeId (the correlation key) from Graph. Needs User.Read.All for this Logic App's managed identity.",
+      "inputs": {
+        "method": "GET",
+        "uri": "https://graph.microsoft.com/v1.0/users/@{triggerBody()?['Assignment']?['Target']?['ObjectId']}?$select=id,employeeId,userPrincipalName,displayName,onPremisesSamAccountName",
+        "authentication": { "type": "ManagedServiceIdentity", "audience": "https://graph.microsoft.com" },
+        "retryPolicy": { "type": "exponential", "count": 4, "interval": "PT10S" }
+      },
+      "runAfter": { "Is_test_call": ["Succeeded"] },
+      "trackedProperties": {
+        "step": "AccessPackageGranted",
+        "employeeId": "@{action()?['outputs']?['body']?['employeeId']}",
+        "objectId": "@{action()?['outputs']?['body']?['id']}",
+        "upn": "@{action()?['outputs']?['body']?['userPrincipalName']}"
+      }
+    },
+    "Start_on_prem_runbook": {
+      "type": "Http",
+      "description": "Create an Automation job on the Hybrid Runbook Worker group (ARM REST, managed identity with Automation Job Operator on the account).",
+      "inputs": {
+        "method": "PUT",
+        "uri": "https://management.azure.com@{parameters('automationAccountId')}/jobs/@{guid()}?api-version=2023-11-01",
+        "headers": { "Content-Type": "application/json" },
+        "body": {
+          "properties": {
+            "runbook": { "name": "@{parameters('runbookName')}" },
+            "runOn": "@{parameters('hybridWorkerGroup')}",
+            "parameters": {
+              "EmployeeId": "@{body('Get_user')?['employeeId']}",
+              "UserPrincipalName": "@{body('Get_user')?['userPrincipalName']}",
+              "DisplayName": "@{body('Get_user')?['displayName']}",
+              "AccessPackage": "@{triggerBody()?['Assignment']?['AccessPackage']?['DisplayName']}",
+              "CorrelationId": "@{coalesce(triggerBody()?['AccessPackageAssignmentRequestId'], workflow()?['run']?['name'])}",
+              "EventTag": "@{parameters('eventTag')}"
+            }
+          }
+        },
+        "authentication": { "type": "ManagedServiceIdentity", "audience": "https://management.azure.com/" },
+        "retryPolicy": { "type": "exponential", "count": 3, "interval": "PT10S" }
+      },
+      "runAfter": { "Get_user": ["Succeeded"] },
+      "trackedProperties": {
+        "step": "OnPremRunbookStarted",
+        "employeeId": "@{action()?['inputs']?['body']?['properties']?['parameters']?['EmployeeId']}",
+        "correlationId": "@{action()?['inputs']?['body']?['properties']?['parameters']?['CorrelationId']}",
+        "jobId": "@{action()?['outputs']?['body']?['properties']?['jobId']}"
+      }
+    }
+  },
+  "outputs": {}
+}

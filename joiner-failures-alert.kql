@@ -1,0 +1,45 @@
+// Alert query: any joiner step that failed in the last 15 minutes, with the
+// fields the on-call card needs (correlationId, employeeId, step, error).
+// Use as a log search alert (frequency 5 min, threshold > 0) with the Teams /
+// email action group of the identity on-call.
+let window = 15m;
+union
+(
+    AppTraces
+    | where TimeGenerated > ago(window)
+    | where SeverityLevel >= 2 and isnotempty(tostring(Properties.employeeId))
+    | project TimeGenerated, correlationId = tostring(Properties.correlationId),
+        employeeId = tostring(Properties.employeeId), step = tostring(Properties.step),
+        error = coalesce(tostring(Properties.error), Message)
+),
+(
+    AzureDiagnostics
+    | where TimeGenerated > ago(window)
+    | where ResourceProvider == "MICROSOFT.LOGIC" and Category == "WorkflowRuntime"
+    | where column_ifexists("status_s", "") in ("Failed", "TimedOut")
+    | project TimeGenerated, correlationId = column_ifexists("trackedProperties_correlationId_s", ""),
+        employeeId = column_ifexists("trackedProperties_employeeId_s", ""),
+        step = coalesce(column_ifexists("trackedProperties_step_s", ""), column_ifexists("resource_actionName_s", "")),
+        error = strcat(column_ifexists("resource_workflowName_s", ""), " ", column_ifexists("code_s", ""), " ",
+                       column_ifexists("error_message_s", ""))
+),
+(
+    AADProvisioningLogs
+    | where TimeGenerated > ago(window)
+    | where ResultType == "Failure"
+    | extend src = parse_json(SourceIdentity)
+    | project TimeGenerated, correlationId = CycleId,
+        employeeId = tostring(coalesce(src.Id, src.id)), step = ProvisioningAction,
+        error = strcat(ResultSignature, " ", ResultDescription)
+),
+(
+    AzureDiagnostics
+    | where TimeGenerated > ago(window)
+    | where ResourceProvider == "MICROSOFT.AUTOMATION" and Category == "JobStreams"
+    | extend line = parse_json(ResultDescription)
+    | where tostring(line.result) in ("timeout", "failed")
+    | project TimeGenerated, correlationId = tostring(line.correlationId),
+        employeeId = tostring(line.employeeId), step = tostring(line.step),
+        error = tostring(line.result)
+)
+| order by TimeGenerated desc

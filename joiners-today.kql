@@ -1,0 +1,25 @@
+// "Joiners today" card: employees who got their UPN for the first time today
+// (the resolver logs result "resolved"; re-sent existing users log "reused"),
+// and how many of them have landed in Entra and in AD. "Landed in AD" means the
+// Cloud Sync (Entra -> AD) job has exported the user.
+let since = startofday(now());
+let sent = AppTraces
+    | where TimeGenerated > since and tostring(Properties.step) == "ResolveUpn"
+    | where tostring(Properties.result) == "resolved"
+    | distinct employeeId = tostring(Properties.employeeId);
+let inbound = AADProvisioningLogs
+    | where TimeGenerated > since
+    | extend src = parse_json(SourceIdentity), tgt = parse_json(TargetIdentity)
+    | extend employeeId = tostring(coalesce(src.Id, src.id)), oid = tostring(coalesce(tgt.Id, tgt.id))
+    | where employeeId in (sent) and ResultType == "Success"
+    | distinct employeeId, oid;
+let inAd = AADProvisioningLogs
+    | where TimeGenerated > since and ResultType == "Success"
+    | extend src = parse_json(SourceIdentity)
+    | extend oid = tostring(coalesce(src.Id, src.id))
+    | join kind=inner inbound on oid
+    | distinct employeeId;
+print joiners = toscalar(sent | count),
+    inEntra = toscalar(inbound | distinct employeeId | count),
+    landedInAd = toscalar(inAd | count)
+| extend waitingOnSync = joiners - landedInAd
